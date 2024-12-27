@@ -1,0 +1,204 @@
+import yfinance as yf
+from sklearn.model_selection import train_test_split, RandomizedSearchCV
+from sklearn.linear_model import LinearRegression
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.preprocessing import StandardScaler
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Updater, CommandHandler,MessageHandler,Filters, CallbackQueryHandler, CallbackContext
+import re
+
+class DolarTahmin:
+    def __init__(self):
+        self.models = [
+            [LinearRegression(), {}],
+            [RandomForestRegressor(), {
+                'n_estimators': [50, 100, 200],
+                'max_depth': [None, 10, 20],
+                'min_samples_split': [2, 5],
+                'min_samples_leaf': [1, 2],
+                'max_features': ["sqrt", "log2"]}],
+            [GradientBoostingRegressor(), {
+                'n_estimators': [50, 100, 200],
+                'learning_rate': [0.01, 0.1, 0.2],
+                'max_depth': [3, 5, 10],
+                'min_samples_split': [2, 5],
+                'min_samples_leaf': [1, 2],
+                'subsample': [0.5, 0.75, 1.0]}],
+            [DecisionTreeRegressor(), {
+                'criterion': ["squared_error", "friedman_mse"],
+                'max_depth': [None, 10, 20],
+                'min_samples_split': [2, 5],
+                'min_samples_leaf': [1, 2],
+                'max_features': ["sqrt", "log2"]}],
+            [KNeighborsRegressor(), {
+                'n_neighbors': [3, 5, 7],
+                'weights': ["uniform", "distance"],
+                'algorithm': ["auto", "ball_tree", "kd_tree", "brute"]}]
+        ]
+        self.best_model = None
+        self.best_params = None
+        self.best_score = None
+        self.scaler = StandardScaler()
+        self.doviz_secimi = None
+        self.tarih_secimi = None
+        self.model_tanim=""
+
+    def veri_yukle(self, period: str):
+        """Veri yükleme ve hazırlama."""
+        data = yf.Ticker(self.doviz_secimi)
+        history = data.history(period=period)
+        if history.empty:
+            raise ValueError("Veri yüklenemedi. Lütfen başka bir döviz çifti veya tarih seçin.")
+        x = history[["High", "Low", "Open"]]
+        y = history["Close"]
+        return train_test_split(x, y, test_size=0.2, random_state=42)
+
+    def model_egit(self, x_train, y_train):
+        """En iyi modeli belirleme."""
+        min_hata = []
+        for model, params in self.models:
+           
+            random_search = RandomizedSearchCV(
+                model, params, scoring="neg_mean_squared_error", cv=5, n_iter=10, random_state=42
+            )
+            random_search.fit(x_train, y_train)
+            min_hata.append({
+                "model": model.__class__.__name__,
+                "params": random_search.best_params_,
+                "score": -random_search.best_score_
+            })
+            print(f"{model.__class__.__name__} için en iyi parametreler: {random_search.best_params_}")
+            print(f"{model.__class__.__name__} için en düşük MSE: {abs(random_search.best_score_)}")
+
+        # En iyi modeli seç
+        self.best_model = min(min_hata, key=lambda x: x["score"])
+        self.best_params = self.best_model["params"]
+        self.best_score = self.best_model["score"]
+        parametre = str(self.best_params)[1:-1].replace(":", "=")
+        parametre = re.sub(r"'", "", parametre)
+        parametre = re.sub(
+            r'(?<==)([^,=]+)(?=,|$)',
+            lambda x: f'"{x.group(0)}"' if re.search(r'[a-zA-Z]', x.group(0)) and x.group(0) not in ["None", "True", "False"] else x.group(0),
+            parametre
+        )
+        parametre = parametre.replace(" ", "")
+        self.model_tanim = self.best_model["model"] + "(" + parametre + ")"
+        print(self.model_tanim)
+        print(f"Oluşturulan model: {self.model_tanim}")
+        print(f"En iyi model: {self.best_model['model']} | En düşük MSE: {self.best_score}")
+        return self.model_tanim
+
+    def anlik_dolar(self):
+        """Anlık döviz kurunu getir."""
+        data = yf.Ticker(self.doviz_secimi)
+        tarih = data.history(interval="1m", period="1d")
+        return tarih["Close"].iloc[-1]
+
+    def tahmin_yap(self):
+        # Veriyi yükle
+
+        data = yf.Ticker(self.doviz_secimi)
+        yillik_dolar = data.history(interval="1h", period="1d")
+        
+        if yillik_dolar.empty:
+            print("Veri yüklenemedi.")
+            return
+        
+        # Özellikler ve hedef
+        x = yillik_dolar.drop(["Close"], axis=1, errors='ignore')
+        y = yillik_dolar["Close"]
+        
+        # Eğitim ve test verisi ayırma
+        x_train, x_test, y_train, y_test = train_test_split(x, y, random_state=42)
+        
+        # Veriyi ölçeklendir
+        self.scaler.fit(x_train)
+        x_train_scaled = self.scaler.transform(x_train)
+        x_test_scaled = self.scaler.transform(x_test)
+        
+        # Modeli seçme
+        model_class = eval(str(self.model_egit(x_train_scaled,y_train)))  # Model adı string olarak gelir
+        model = model_class  # Model sınıfı örneği
+        model.fit(x_train_scaled, y_train)  # Modeli eğit
+        
+        # Tahmin yap
+        tahmin = model.predict(x_test_scaled[:1])  # İlk test verisiyle tahmin yap
+        
+        return tahmin[0]
+
+
+
+    def start(self, update: Update, context: CallbackContext) -> None:
+        """Başlangıç komutu."""
+        keyboard = [
+            [InlineKeyboardButton("Döviz Seç", callback_data='doviz_sec')],
+            [InlineKeyboardButton("Tahmini Kur", callback_data='tahmin')],
+            [InlineKeyboardButton("Anlık Kur", callback_data='anlik')],
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        update.message.reply_text("Lütfen bir işlem seçin:", reply_markup=reply_markup)
+
+    def handle_button(self, update: Update, context: CallbackContext) -> None:
+        """Kullanıcı seçimlerini işleme."""
+        query = update.callback_query
+        query.answer()
+        if query.data == 'doviz_sec':
+            self.doviz_sec(update, context)
+        elif query.data in ['USDTRY=X', 'EURUSD=X', 'GBPTRY=X']:
+            self.doviz_secimi = query.data
+            query.edit_message_text(f"Seçtiğiniz döviz: {self.doviz_secimi}")
+            self.tarih_sec(update, context)
+        elif query.data in ['10y', '5y', '1y', '1m', '1d']:
+            self.tarih_secimi = query.data
+            query.edit_message_text(f"Seçtiğiniz tarih aralığı: {self.tarih_secimi}")
+        elif query.data == 'tahmin':
+            if self.doviz_secimi and self.tarih_secimi:
+                tahmini_kur = self.tahmin_yap()
+                query.edit_message_text(f"Tahmini Kur: {tahmini_kur:.2f} TRY")
+            else:
+                query.edit_message_text("Lütfen önce döviz ve tarih seçin.")
+        elif query.data == 'anlik':
+            if self.doviz_secimi:
+                anlik_kur = self.anlik_dolar()
+                query.edit_message_text(f"Anlık Kur: {anlik_kur:.2f} TRY")
+            else:
+                query.edit_message_text("Lütfen önce döviz seçin.")
+
+    def doviz_sec(self, update: Update, context: CallbackContext) -> None:
+        """Döviz seçimi ekranı."""
+        keyboard = [
+            [InlineKeyboardButton("USD/TRY", callback_data='USDTRY=X')],
+            [InlineKeyboardButton("EUR/USD", callback_data='EURUSD=X')],
+            [InlineKeyboardButton("GBP/TRY", callback_data='GBPTRY=X')],
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        update.callback_query.edit_message_text("Bir döviz çifti seçin:", reply_markup=reply_markup)
+
+    def tarih_sec(self, update: Update, context: CallbackContext) -> None:
+        """Tarih seçimi ekranı."""
+        keyboard = [
+            [InlineKeyboardButton("10 yıl", callback_data='10y')],
+            [InlineKeyboardButton("5 yıl", callback_data='5y')],
+            [InlineKeyboardButton("1 yıl", callback_data='1y')],
+            [InlineKeyboardButton("1 ay", callback_data='1m')],
+            [InlineKeyboardButton("1 gün", callback_data='1d')],
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        update.callback_query.edit_message_text("Bir tarih aralığı seçin:", reply_markup=reply_markup)
+
+    def main(self):
+        """Botun ana fonksiyonu."""
+        updater = Updater("7923887145:AAHJvA7hJCS3qM1uR5uh6Nik6rLQ26P3Oz0", use_context=True)
+        dispatcher = updater.dispatcher
+        message_handler = MessageHandler(Filters.text & ~Filters.command, self.start)
+        dispatcher.add_handler(message_handler)
+
+        dispatcher.add_handler(CallbackQueryHandler(self.handle_button))
+        updater.start_polling()
+        updater.idle()
+
+if __name__ == "__main__":
+    bot = DolarTahmin()
+    bot.main()
